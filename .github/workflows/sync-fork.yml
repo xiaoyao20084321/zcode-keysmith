@@ -1,0 +1,32 @@
+name: Sync Fork
+
+on:
+  schedule:
+    # 每天 UTC 01:00，即北京时间上午 9 点
+    - cron: '0 1 * * *'
+  # 允许在 Actions 页面手动执行
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    name: Sync with Upstream
+    runs-on: ubuntu-latest
+    # 仅在 fork 仓库中执行同步
+    if: github.event.repository.fork
+
+    steps:
+      - name: Sync upstream
+        env:
+          # GitHub 自动提供，无需手动创建这个 Secret
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # 自动获取当前 fork 的仓库名和默认分支
+          REPOSITORY: ${{ github.repository }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: gh repo sync "$REPOSITORY" --branch "$DEFAULT_BRANCH"
+
+      - name: Report failure
+        if: failure()
+        run: echo "::error::同步失败，请在 Actions 日志中检查具体原因。"
