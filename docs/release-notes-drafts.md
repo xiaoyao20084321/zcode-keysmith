@@ -1,5 +1,11 @@
 # Release Notes 草稿
 
+## zcode-keysmith v0.3.2
+
+ZCode 3.14 改了 runtime 锚点，0.3.1 装不上。这一版同时识别 3.12 和 3.14，装完仍可卸载还原。App 自动更新会抹掉补丁，更新后需要再装一次。
+
+装完请完全退出并重新打开 ZCode，再开一轮新对话。本次不发布桌面安装包。
+
 ## zcode-keysmith v0.3.1
 
 ZCode 3.12 装旧版会停在启动页。这一版不再劫持官方 Agent；3.12 改为备份并补丁 runtime，卸载能还原。Latest 现在有稳定版压缩包，先校验再装。

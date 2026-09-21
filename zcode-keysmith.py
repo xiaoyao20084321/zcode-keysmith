@@ -41,7 +41,7 @@ REPO_ROOT = (
     if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS")
     else Path(__file__).resolve().parent
 )
-__version__ = "0.3.1"
+__version__ = "0.3.2"
 VERSION = __version__
 JSON_SCHEMA = "zcode-keysmith/v1"
 _LAST_USAGE_ERROR: list[str | None] = [None]
@@ -61,12 +61,25 @@ DEFAULT_ZCODE_HELPER_NODE_COMMAND = DEFAULT_ZCODE_APP / "Contents" / "Frameworks
 DEFAULT_ZCODE_NODE_COMMAND = DEFAULT_ZCODE_HELPER_NODE_COMMAND
 FALLBACK_ZCODE_NODE_COMMAND = DEFAULT_ZCODE_APP / "Contents" / "MacOS" / "ZCode"
 DEFAULT_AGENT_ARGS_JSON = '["app-server","--stdio"]'
-PATCH_NEEDLE = "customSystemPrompt:this.config.systemPrompt,language:"
+# 3.14 inserts workflowActor between systemPrompt and language; keep 3.12 as a fallback.
+PATCH_NEEDLES = (
+    "customSystemPrompt:this.config.systemPrompt,workflowActor:this.config.workflowActor,language:",
+    "customSystemPrompt:this.config.systemPrompt,language:",
+)
+CUSTOM_SYSTEM_PROMPT_ASSIGN = "customSystemPrompt:this.config.systemPrompt"
 RUNTIME_PATCH_MARKER = "ZCODE_KEYSMITH_SYSTEM_FILE"
 PREFER_MANAGED_MARKER = "if(x&&x.trim())return x"
-# Minified CLI-prefix push: if(t.push(Xxx()),o?t.push(Yyy({name:"Custom System Prompt"
+# 3.12: if(t.push(Xxx()),o?t.push(Yyy({name:"Custom System Prompt"
 _LRE_PUSH_RE = re.compile(
     r'if\(t\.push\(([A-Za-z0-9]+)\(\)\),o\?t\.push\(([A-Za-z0-9]+)\(\{name:"Custom System Prompt"'
+)
+# 3.14: if(l||t.push(Xxx()),s?t.push(Yyy({name:"Custom System Prompt"
+_LRE_PUSH_RE_V314 = re.compile(
+    r'if\(([A-Za-z0-9]+)\|\|t\.push\(([A-Za-z0-9]+)\(\)\),([A-Za-z0-9]+)\?t\.push\(([A-Za-z0-9]+)\(\{name:"Custom System Prompt"'
+)
+_CLI_PREFIX_SKIPPED_RE = re.compile(
+    r'if\(\(([A-Za-z0-9]+)\|\|t\.push\(|'
+    r'if\(([A-Za-z0-9]+)\|\|([A-Za-z0-9]+)\|\|t\.push\('
 )
 OVERRIDE_NEEDLE = (
     "IMPORTANT: These instructions OVERRIDE any default behavior and you MUST follow them exactly as written."
@@ -411,8 +424,15 @@ def runtime_text_prefers_managed(text: str) -> bool:
     return runtime_text_is_keysmith_patched(text) and PREFER_MANAGED_MARKER in text
 
 
+def vendor_patch_anchor(text: str) -> str | None:
+    for needle in PATCH_NEEDLES:
+        if needle in text:
+            return needle
+    return None
+
+
 def runtime_is_patchable_text(text: str) -> bool:
-    return PATCH_NEEDLE in text or runtime_text_is_keysmith_patched(text)
+    return vendor_patch_anchor(text) is not None or runtime_text_is_keysmith_patched(text)
 
 
 def ensure_runtime_patchable(runtime_path: Path) -> None:
@@ -436,11 +456,26 @@ def build_system_prompt_expression(system_file: str) -> str:
     )
 
 
+def replace_vendor_system_prompt_anchor(original_runtime: str, expression: str) -> str:
+    needle = vendor_patch_anchor(original_runtime)
+    if needle is None:
+        raise KeysmithError("ZCode runtime patch anchor not found")
+    if needle == PATCH_NEEDLES[0]:
+        expression = "this.config.workflowActor===void 0?" + expression + ":void 0"
+    suffix = needle[len(CUSTOM_SYSTEM_PROMPT_ASSIGN) :]
+    return original_runtime.replace(needle, "customSystemPrompt:" + expression + suffix, 1)
+
+
 def apply_followup_runtime_patches(text: str) -> str:
     """Keep Pier above platform CLI prefix and agentsMd OVERRIDE copy."""
     patched, _n = _LRE_PUSH_RE.subn(
         r'if((o||t.push(\1())),o?t.push(\2({name:"Custom System Prompt"',
         text,
+        count=1,
+    )
+    patched, _n = _LRE_PUSH_RE_V314.subn(
+        r'if(\3||\1||t.push(\2()),\3?t.push(\4({name:"Custom System Prompt"',
+        patched,
         count=1,
     )
     if OVERRIDE_NEEDLE in patched:
@@ -449,10 +484,9 @@ def apply_followup_runtime_patches(text: str) -> str:
 
 
 def build_patched_runtime_text(original_runtime: str, system_file: str) -> str:
-    if PATCH_NEEDLE not in original_runtime:
-        raise KeysmithError("ZCode runtime patch anchor not found")
-    replacement = "customSystemPrompt:" + build_system_prompt_expression(system_file) + ",language:"
-    patched = original_runtime.replace(PATCH_NEEDLE, replacement, 1)
+    patched = replace_vendor_system_prompt_anchor(
+        original_runtime, build_system_prompt_expression(system_file)
+    )
     return apply_followup_runtime_patches(patched)
 
 
@@ -504,7 +538,7 @@ def apply_runtime_patch(plan: InstallPlan) -> list[Path]:
             mode = stat.S_IMODE(runtime_path.stat().st_mode)
             write_text_atomic(runtime_path, follow, mode)
         return backups
-    if runtime_text_is_keysmith_patched(text) and PATCH_NEEDLE not in text:
+    if runtime_text_is_keysmith_patched(text) and vendor_patch_anchor(text) is None:
         saved = load_saved_config(plan.paths) or {}
         backup = saved.get("runtime_original_backup")
         if not isinstance(backup, str) or not Path(backup).is_file():
@@ -513,7 +547,7 @@ def apply_runtime_patch(plan: InstallPlan) -> list[Path]:
                 "and the original backup is missing. Restore the vendor zcode.cjs first."
             )
         text = Path(backup).read_text(encoding="utf-8")
-    if PATCH_NEEDLE not in text:
+    if vendor_patch_anchor(text) is None:
         raise KeysmithError(f"ZCode runtime patch anchor not found: {runtime_path}")
     digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
     backup_path = original_runtime_backup_path(plan, digest)
@@ -904,7 +938,10 @@ def render_preload(plan: InstallPlan) -> str:
         f"const SYSTEM_FILE = process.env.ZCODE_KEYSMITH_SYSTEM_FILE || {system_file_json};\n"
         f"const LOG_DIR = process.env.ZCODE_KEYSMITH_LOG_DIR || {log_dir_json};\n"
         "const LOG_FILE = path.join(LOG_DIR, \"wrapper-start.jsonl\");\n"
-        "const NEEDLE = \"customSystemPrompt:this.config.systemPrompt,language:\";\n"
+        "const NEEDLES = [\n"
+        "  \"customSystemPrompt:this.config.systemPrompt,workflowActor:this.config.workflowActor,language:\",\n"
+        "  \"customSystemPrompt:this.config.systemPrompt,language:\"\n"
+        "];\n"
         "\n"
         "function managedPromptExpression() {\n"
         "  const file = JSON.stringify(process.env.ZCODE_KEYSMITH_SYSTEM_FILE || SYSTEM_FILE);\n"
@@ -917,8 +954,15 @@ def render_preload(plan: InstallPlan) -> str:
         "}\n"
         "\n"
         "function patchSource(source) {\n"
-        "  if (!source.includes(NEEDLE)) return source;\n"
-        "  return source.replace(NEEDLE, \"customSystemPrompt:\" + managedPromptExpression() + \",language:\");\n"
+        "  for (const needle of NEEDLES) {\n"
+        "    if (!source.includes(needle)) continue;\n"
+        "    const suffix = needle.slice(\"customSystemPrompt:this.config.systemPrompt\".length);\n"
+        "    const expression = needle === NEEDLES[0]\n"
+        "      ? \"this.config.workflowActor===void 0?\" + managedPromptExpression() + \":void 0\"\n"
+        "      : managedPromptExpression();\n"
+        "    return source.replace(needle, \"customSystemPrompt:\" + expression + suffix);\n"
+        "  }\n"
+        "  return source;\n"
         "}\n"
         "\n"
         "function logInvocation() {\n"
@@ -966,7 +1010,7 @@ def render_wrapper(plan: InstallPlan) -> str:
     node_command_json = json.dumps(str(plan.node_command), ensure_ascii=False)
     cache_dir_json = json.dumps(str(plan.paths.cache_dir), ensure_ascii=False)
     log_dir_json = json.dumps(str(plan.paths.log_dir), ensure_ascii=False)
-    patch_needle_json = json.dumps(PATCH_NEEDLE, ensure_ascii=False)
+    patch_needles_json = json.dumps(list(PATCH_NEEDLES), ensure_ascii=False)
     return f'''#!/usr/bin/env python3
 from __future__ import annotations
 
@@ -984,7 +1028,7 @@ import time
 ORIGINAL_RUNTIME = pathlib.Path(os.environ.get("ZCODE_KEYSMITH_ORIGINAL") or {runtime_json})
 SYSTEM_FILE = pathlib.Path(os.environ.get("ZCODE_KEYSMITH_SYSTEM_FILE") or {system_file_json})
 NODE_COMMAND = os.environ.get("ZCODE_KEYSMITH_NODE_COMMAND") or {node_command_json}
-PATCH_NEEDLE = {patch_needle_json}
+PATCH_NEEDLES = {patch_needles_json}
 CACHE_DIR = pathlib.Path(os.environ.get("ZCODE_KEYSMITH_CACHE_DIR") or {cache_dir_json})
 LOG_DIR = pathlib.Path(os.environ.get("ZCODE_KEYSMITH_LOG_DIR") or {log_dir_json})
 LOG_FILE = LOG_DIR / "wrapper-start.jsonl"
@@ -1073,10 +1117,15 @@ def system_prompt_expression() -> str:
 
 def patched_runtime_path() -> pathlib.Path:
     original = ORIGINAL_RUNTIME.read_text(encoding="utf-8")
-    if PATCH_NEEDLE not in original:
+    needle = next((item for item in PATCH_NEEDLES if item in original), None)
+    if needle is None:
         raise RuntimeError(f"ZCode runtime patch anchor not found: {{ORIGINAL_RUNTIME}}")
-    replacement = "customSystemPrompt:" + system_prompt_expression() + ",language:"
-    patched = original.replace(PATCH_NEEDLE, replacement, 1)
+    suffix = needle[len("customSystemPrompt:this.config.systemPrompt"):]
+    expression = system_prompt_expression()
+    if needle == PATCH_NEEDLES[0]:
+        expression = "this.config.workflowActor===void 0?" + expression + ":void 0"
+    replacement = "customSystemPrompt:" + expression + suffix
+    patched = original.replace(needle, replacement, 1)
     digest = hashlib.sha256((str(ORIGINAL_RUNTIME) + "\\0" + original + "\\0" + replacement).encode("utf-8")).hexdigest()[:16]
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     path = CACHE_DIR / f"zcode-keysmith-runtime-{{digest}}.cjs"
@@ -1500,7 +1549,7 @@ def persistent_environment_value(key: str) -> str | None:
 
 
 def _runtime_cli_prefix_skipped(runtime_text: str) -> bool:
-    return "o||t.push(" in runtime_text and 'name:"Custom System Prompt"' in runtime_text
+    return bool(_CLI_PREFIX_SKIPPED_RE.search(runtime_text)) and 'name:"Custom System Prompt"' in runtime_text
 
 
 def _runtime_override_neutralized(runtime_text: str) -> bool:

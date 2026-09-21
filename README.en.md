@@ -84,7 +84,7 @@ On the same model and the same 10 prompts, complete artifacts rose from 1 to 4. 
 
 ## Get started
 
-ZCode must already be installed. Prefer the stable zip. Use 0.3.1 on ZCode 3.12; `v0.3.0` stops on the startup screen.
+ZCode must already be installed. The commands below download the currently published 0.3.1 zip, which does not support ZCode 3.14. The 3.14 fix is in the 0.3.2 source; wait for its Release and use that version's zip and checksum file. `v0.3.0` stops on the startup screen. ZCode auto-updates replace the runtime and wipe the patch, so reinstall after an app update.
 
 **macOS:**
 

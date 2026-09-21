@@ -5,6 +5,7 @@ import json
 import os
 import plistlib
 import py_compile
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -25,9 +26,20 @@ def isolate_zcode_environment(monkeypatch):
         monkeypatch.delenv(key, raising=False)
 
 
-def make_runtime(path: Path) -> None:
+RUNTIME_V312 = (
+    'if(t.push(Sle()),o?t.push(oDi({name:"Custom System Prompt",source:"x"})):t.push(Alt(r)));'
+    "const x={customSystemPrompt:this.config.systemPrompt,language:this.config.language};"
+)
+RUNTIME_V314 = (
+    'if(a!==void 0&&s)throw new Error("ContextBuilder: workflowActor and customSystemPrompt are mutually exclusive");'
+    'let l=a!==void 0;if(l||t.push(JMe()),s?t.push(dGs({name:"Custom System Prompt",source:"x"})):t.push(Qfn(n)));'
+    "const x={customSystemPrompt:this.config.systemPrompt,workflowActor:this.config.workflowActor,language:this.config.language};"
+)
+
+
+def make_runtime(path: Path, text: str | None = None) -> None:
     path.write_text(
-        "const x={customSystemPrompt:this.config.systemPrompt,language:this.config.language};\n",
+        text or "const x={customSystemPrompt:this.config.systemPrompt,language:this.config.language};\n",
         encoding="utf-8",
     )
 
@@ -42,7 +54,7 @@ def test_cli_reports_release_version():
     )
 
     assert completed.returncode == 0
-    assert completed.stdout.strip() == "zcode-keysmith.py 0.3.1"
+    assert completed.stdout.strip() == "zcode-keysmith.py 0.3.2"
     assert completed.stderr == ""
     assert mod.VERSION == (MODULE_PATH.parent / "VERSION").read_text(encoding="ascii").strip()
 
@@ -91,13 +103,67 @@ def test_patch_rewrites_custom_system_prompt_to_managed_file():
 
 
 def test_patch_skips_cli_prefix_when_custom_system_prompt_is_set():
-    original = (
-        'if(t.push(Sle()),o?t.push(oDi({name:"Custom System Prompt",source:"x"})):t.push(Alt(r)));'
-        "const x={customSystemPrompt:this.config.systemPrompt,language:this.config.language};"
-    )
-    patched = mod.build_patched_runtime_text(original, "/tmp/system-role.md")
+    patched = mod.build_patched_runtime_text(RUNTIME_V312, "/tmp/system-role.md")
     assert 'if((o||t.push(Sle())),o?t.push(oDi({name:"Custom System Prompt"' in patched
     assert 'if(t.push(Sle()),o?t.push(oDi({name:"Custom System Prompt"' not in patched
+
+
+def test_patch_accepts_zcode_314_runtime_anchor():
+    original = RUNTIME_V314
+    patched = mod.build_patched_runtime_text(original, "/tmp/system-role.md")
+    assert "ZCODE_KEYSMITH_SYSTEM_FILE" in patched
+    assert "if(x&&x.trim())return x" in patched
+    assert "workflowActor:this.config.workflowActor,language:" in patched
+    assert "customSystemPrompt:this.config.systemPrompt,workflowActor:this.config.workflowActor,language:" not in patched
+    assert "customSystemPrompt:this.config.workflowActor===void 0?" in patched
+    assert ":void 0,workflowActor:this.config.workflowActor" in patched
+    assert 'if(s||l||t.push(JMe()),s?t.push(dGs({name:"Custom System Prompt"' in patched
+    assert 'if(l||t.push(JMe()),s?t.push(dGs({name:"Custom System Prompt"' not in patched
+    assert 'if(a!==void 0&&s)throw new Error("ContextBuilder: workflowActor and customSystemPrompt are mutually exclusive")' in patched
+    assert mod._runtime_cli_prefix_skipped(patched)
+    assert mod.runtime_is_patchable_text(original)
+    assert not mod.runtime_is_patchable_text("const x=1;")
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is needed to execute JS fixture")
+def test_zcode_314_prompt_keeps_workflow_context_native(tmp_path):
+    runtime = (
+        'const JMe=()=>"prefix",dGs=x=>x,emn=x=>({workflow:x}),Qfn=()=>"default";'
+        'class Builder{constructor(config){this.config=config}build(){let t=[],'
+        'o=this.config.customSystemPrompt?.trim(),s=!!o,a=this.config.workflowActor;'
+        'if(a!==void 0&&s)throw new Error("ContextBuilder: workflowActor and customSystemPrompt are mutually exclusive");'
+        'let l=a!==void 0;if(l||t.push(JMe()),s?t.push(dGs({name:"Custom System Prompt",content:o})):'
+        'a!==void 0?t.push(emn(a)):t.push(Qfn()),!s){}return t}}'
+        'function make(config){return new Builder({customSystemPrompt:this.config.systemPrompt,'
+        'workflowActor:this.config.workflowActor,language:this.config.language})}'
+        'module.exports=config=>make.call({config}).build();'
+    )
+    patched = tmp_path / "runtime.cjs"
+    patched.write_text(mod.build_patched_runtime_text(runtime, str(tmp_path / "system.md")), encoding="utf-8")
+    (tmp_path / "system.md").write_text("managed system", encoding="utf-8")
+    node = shutil.which("node")
+    assert node is not None
+    assert subprocess.run([node, "--check", str(patched)], capture_output=True).returncode == 0
+
+    def build(config):
+        result = subprocess.run(
+            [node, "-e", "console.log(JSON.stringify(require(process.argv[1])(JSON.parse(process.argv[2]))))",
+             str(patched), json.dumps(config)],
+            text=True, capture_output=True, check=True,
+        )
+        return json.loads(result.stdout)
+
+    assert build({"systemPrompt": "vendor"}) == [
+        {"name": "Custom System Prompt", "content": "managed system"}
+    ]
+    assert build({"workflowActor": "delegate"}) == [{"workflow": "delegate"}]
+    assert build({"workflowActor": "delegate", "systemPrompt": "vendor"}) == [
+        {"workflow": "delegate"}
+    ]
+    (tmp_path / "system.md").unlink()
+    assert build({"systemPrompt": "vendor"}) == [
+        {"name": "Custom System Prompt", "content": "vendor"}
+    ]
 
 
 def test_patch_neutralizes_agentsmd_override_when_custom_prompt_is_set():
@@ -135,6 +201,33 @@ def test_apply_runtime_patch_applies_followups_on_already_managed_runtime(tmp_pa
     assert 'if((o||t.push(Sle())),o?t.push(oDi({name:"Custom System Prompt"' in patched
 
 
+def test_apply_runtime_patch_applies_314_followups_on_already_managed_runtime(tmp_path):
+    runtime = tmp_path / "zcode.cjs"
+    managed = (
+        'if(a!==void 0&&s)throw new Error("ContextBuilder: workflowActor and customSystemPrompt are mutually exclusive");'
+        'let l=a!==void 0;if(l||t.push(JMe()),s?t.push(dGs({name:"Custom System Prompt"})):t.push(Qfn(n)));'
+        "IMPORTANT: These instructions OVERRIDE any default behavior and you MUST follow them exactly as written."
+        "customSystemPrompt:(()=>{try{let e=process.env.ZCODE_KEYSMITH_SYSTEM_FILE||\"/tmp/system-role.md\";"
+        "let t=require(\"node:fs\");if(t.existsSync(e)){let x=t.readFileSync(e,\"utf8\");if(x&&x.trim())return x}}"
+        "catch{}return this.config.systemPrompt})(),workflowActor:this.config.workflowActor,language:"
+    )
+    runtime.write_text(managed, encoding="utf-8")
+    plan = mod.InstallPlan(
+        paths=mod.build_paths(tmp_path / "managed"),
+        source_system_file=tmp_path / "source.md",
+        zcode_runtime=runtime,
+        node_command=tmp_path / "node",
+        activate=False,
+        injection_mode=mod.INJECTION_RUNTIME_PATCH,
+    )
+    backups = mod.apply_runtime_patch(plan)
+    assert backups == []
+    patched = runtime.read_text(encoding="utf-8")
+    assert "OVERRIDE any default behavior" not in patched
+    assert 'if(s||l||t.push(JMe()),s?t.push(dGs({name:"Custom System Prompt"' in patched
+    assert 'if(a!==void 0&&s)throw new Error("ContextBuilder: workflowActor and customSystemPrompt are mutually exclusive")' in patched
+
+
 def test_patch_requires_known_runtime_anchor():
     try:
         mod.build_patched_runtime_text("const x = 1;", "/tmp/system-role.md")
@@ -142,6 +235,29 @@ def test_patch_requires_known_runtime_anchor():
         assert "anchor" in str(exc)
     else:
         raise AssertionError("patching should require the ZCode runtime anchor")
+
+
+def test_install_dry_run_accepts_zcode_314_without_writing(tmp_path, capsys):
+    runtime = tmp_path / "zcode.cjs"
+    make_runtime(runtime, RUNTIME_V314)
+    source = tmp_path / "source.md"
+    source.write_text("# system\n", encoding="utf-8")
+    node_command = tmp_path / "node"
+    node_command.write_text("#!/bin/sh\n", encoding="utf-8")
+    node_command.chmod(0o755)
+    managed = tmp_path / "managed"
+
+    code = mod.main([
+        "install", "--system-file", str(source), "--managed-dir", str(managed),
+        "--launch-agent", str(tmp_path / "agent.plist"),
+        "--zcode-runtime", str(runtime), "--node-command", str(node_command),
+        "--dry-run",
+    ])
+
+    assert code == 0
+    assert "write: false" in capsys.readouterr().out
+    assert runtime.read_text(encoding="utf-8") == RUNTIME_V314
+    assert not managed.exists()
 
 
 def test_install_dry_run_does_not_write(tmp_path, capsys):
@@ -260,6 +376,9 @@ def test_rendered_wrapper_is_valid_python_and_uses_configured_cache_dir(tmp_path
     assert "proc.wait()" in wrapper_text
     # Windows binds the parent's OS handles explicitly.
     assert "env=env" in wrapper_text
+    assert "workflowActor:this.config.workflowActor,language:" in wrapper_text
+    assert "PATCH_NEEDLES" in wrapper_text
+    assert "this.config.workflowActor===void 0?" in wrapper_text
 
 
 def test_rendered_wrapper_cache_write_is_safe_under_concurrent_start(tmp_path):
@@ -639,6 +758,85 @@ def test_runtime_patch_install_rewrites_vendor_runtime_and_keeps_backup(tmp_path
     assert backup.is_file()
     assert backup.read_text(encoding="utf-8") == original
     assert "if(x&&x.trim())return x" in runtime.read_text(encoding="utf-8")
+
+
+def test_runtime_patch_install_accepts_zcode_314_vendor_runtime(tmp_path, monkeypatch):
+    monkeypatch.setattr(mod.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(mod, "is_zcode_running", lambda: False)
+    app = tmp_path / "ZCode.app"
+    asar = app / "Contents" / "Resources" / "app.asar"
+    asar.parent.mkdir(parents=True)
+    asar.write_bytes(b"ZCODE_AGENT_SERVER_COMMAND\nsupportsStorageStartup\n")
+    runtime = app / "Contents" / "Resources" / "glm" / "zcode.cjs"
+    runtime.parent.mkdir(parents=True)
+    make_runtime(runtime, RUNTIME_V314)
+    original = runtime.read_text(encoding="utf-8")
+    source = tmp_path / "source.md"
+    source.write_text("# managed system\n", encoding="utf-8")
+    node_command = tmp_path / "node"
+    node_command.write_text("#!/bin/sh\n", encoding="utf-8")
+    node_command.chmod(0o755)
+    managed = tmp_path / "managed"
+
+    code = mod.main([
+        "install",
+        "--system-file", str(source),
+        "--managed-dir", str(managed),
+        "--launch-agent", str(tmp_path / "agent.plist"),
+        "--zcode-runtime", str(runtime),
+        "--node-command", str(node_command),
+        "--yes",
+        "--no-activate",
+    ])
+
+    assert code == 0
+    patched = runtime.read_text(encoding="utf-8")
+    assert "if(x&&x.trim())return x" in patched
+    assert "customSystemPrompt:this.config.systemPrompt,workflowActor:this.config.workflowActor,language:" not in patched
+    assert "workflowActor:this.config.workflowActor,language:" in patched
+    assert "customSystemPrompt:this.config.workflowActor===void 0?" in patched
+    assert ":void 0,workflowActor:this.config.workflowActor" in patched
+    assert 'if(s||l||t.push(JMe()),s?t.push(dGs({name:"Custom System Prompt"' in patched
+    assert 'if(a!==void 0&&s)throw new Error("ContextBuilder: workflowActor and customSystemPrompt are mutually exclusive")' in patched
+    backup = Path(json.loads((managed / "config.json").read_text(encoding="utf-8"))["runtime_original_backup"])
+    assert backup.read_text(encoding="utf-8") == original
+
+    code = mod.main([
+        "uninstall", "--managed-dir", str(managed),
+        "--launch-agent", str(tmp_path / "agent.plist"),
+        "--zcode-runtime", str(runtime), "--node-command", str(node_command),
+        "--yes", "--no-activate",
+    ])
+    assert code == 0
+    assert runtime.read_text(encoding="utf-8") == original
+
+
+def test_wrapper_patches_zcode_314_runtime_into_cache(tmp_path):
+    runtime = tmp_path / "zcode.cjs"
+    runtime.write_text("MARKER = '''" + RUNTIME_V314 + "'''\n", encoding="utf-8")
+    source = tmp_path / "source.md"
+    source.write_text("# system\n", encoding="utf-8")
+    node_command = Path(sys.executable)
+    paths = mod.build_paths(tmp_path / "managed", tmp_path / "agent.plist")
+    paths.wrapper.parent.mkdir(parents=True)
+    plan = mod.InstallPlan(paths, source, runtime, node_command, False)
+    paths.wrapper.write_text(mod.render_wrapper(plan), encoding="utf-8")
+
+    completed = subprocess.run(
+        [sys.executable, str(paths.wrapper), "--help"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    cached = list(paths.cache_dir.glob("zcode-keysmith-runtime-*.cjs"))
+    assert len(cached) == 1
+    patched = cached[0].read_text(encoding="utf-8")
+    assert "ZCODE_KEYSMITH_SYSTEM_FILE" in patched
+    assert "customSystemPrompt:this.config.systemPrompt,workflowActor:this.config.workflowActor,language:" not in patched
+    assert "customSystemPrompt:this.config.workflowActor===void 0?" in patched
+    assert "workflowActor:this.config.workflowActor,language:" in patched
 
 
 def test_injection_mode_follows_storage_startup_marker(tmp_path):

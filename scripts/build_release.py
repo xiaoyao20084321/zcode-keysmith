@@ -10,7 +10,7 @@ import sys
 import zipfile
 from pathlib import Path
 
-ZIP_TIMESTAMP = (2026, 9, 19, 0, 0, 0)
+ZIP_TIMESTAMP = (2026, 9, 20, 0, 0, 0)
 VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
 VERSION_ASSIGN_RE = re.compile(r'^__version__ = "([^"]+)"$', re.MULTILINE)
 

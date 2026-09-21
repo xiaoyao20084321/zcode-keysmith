@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [0.3.2] - 待发布
+
+- 适配 ZCode 3.14.0 的 runtime 锚点：`customSystemPrompt` 配置对象中间插入了 `workflowActor`，CLI-prefix 守卫也从 `if(t.push(...),o?...)` 改成 `if(l||t.push(...),s?...)`。0.3.1 会因此报 `entrypoint shape was not recognized`，CLI-prefix skip 即使主锚点修好也会静默失效。
+- 安装器同时识别 3.12 与 3.14 锚点，保留 3.12 形态；3.14 仅在没有 `workflowActor` 时注入受管提示词，保留原生互斥检查和 workflow 子会话上下文。
+- 自动更新会整包替换 `glm/zcode.cjs` 并抹掉补丁。更新后需重新 `install`；卸载仍从备份还原。
+
 ## [0.3.1] - 2026-09-19
 
 - 兼容 ZCode 3.12 桌面端独立存储启动，且不削弱 Keysmith 注入：检测到 `supportsStorageStartup` 后不再设置 `ZCODE_AGENT_SERVER_COMMAND`（否则启动页停在 unsupported_runtime），也不再依赖打包 Electron 会删除的 `NODE_OPTIONS --require` preload。3.12+ 改为备份并原地补丁 `glm/zcode.cjs`，让 `customSystemPrompt` **优先读取** managed `system-role.md`。卸载还原备份。旧版 ZCode 仍走 wrapper，同一套 prefer-managed 表达式。
