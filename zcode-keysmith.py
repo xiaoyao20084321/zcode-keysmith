@@ -28,6 +28,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -107,6 +108,16 @@ MANAGED_ENV_KEYS = (
     *LEGACY_AGENT_OVERRIDE_ENV_KEYS,
     *CORE_KEYSMITH_ENV_KEYS,
 )
+DEFAULT_INSTALLER_COPY_NAME = "zcode-keysmith.py"
+AUTO_REPATCH_STATUS_NAME = "auto-repatch.json"
+AUTO_REPATCH_LOG_NAME = "auto-repatch.log"
+AUTO_REPATCH_SCHEMA = "zcode-keysmith/auto-repatch/v1"
+WATCH_START_INTERVAL_SECONDS = 300
+WATCH_THROTTLE_INTERVAL_SECONDS = 10
+WATCH_SETTLE_TIMEOUT_SECONDS = 90.0
+WATCH_SETTLE_STABLE_SECONDS = 3.0
+WATCH_SETTLE_POLL_SECONDS = 0.5
+WATCH_QUIT_TIMEOUT_SECONDS = 20.0
 
 
 class KeysmithError(Exception):
@@ -697,6 +708,18 @@ def restore_replaced_files(replaced: list[tuple[Path, Path | None]]) -> None:
         raise KeysmithError("file rollback failed:\n" + "\n".join(errors))
 
 
+def installer_copy_path(paths: InstallPaths) -> Path:
+    return paths.managed_dir / "bin" / DEFAULT_INSTALLER_COPY_NAME
+
+
+def auto_repatch_status_path(paths: InstallPaths) -> Path:
+    return paths.log_dir / AUTO_REPATCH_STATUS_NAME
+
+
+def auto_repatch_log_path(paths: InstallPaths) -> Path:
+    return paths.log_dir / AUTO_REPATCH_LOG_NAME
+
+
 def install_managed_files(
     plan: InstallPlan,
     system_prompt: str,
@@ -710,6 +733,14 @@ def install_managed_files(
     ]
     if not uses_runtime_patch(plan):
         payloads.insert(3, (plan.paths.preload, render_preload(plan), 0o644))
+    if uses_runtime_patch(plan) and platform.system() == "Darwin":
+        payloads.append(
+            (
+                installer_copy_path(plan.paths),
+                Path(__file__).resolve().read_text(encoding="utf-8"),
+                0o755,
+            )
+        )
     staged: list[tuple[Path, Path]] = []
     replaced: list[tuple[Path, Path | None]] = []
     backups: list[Path] = []
@@ -874,6 +905,17 @@ def render_env_script(plan: InstallPlan) -> str:
     lines = ["#!/bin/sh", "set -eu"]
     for key, value in env_values(plan).items():
         lines.append(f"launchctl setenv {key} {sh_single_quote(value)}")
+    if uses_runtime_patch(plan):
+        lines.append(
+            "exec "
+            f"{sh_single_quote(str(Path(sys.executable).resolve()))} "
+            f"{sh_single_quote(str(installer_copy_path(plan.paths)))} "
+            "watch "
+            f"--managed-dir {sh_single_quote(str(plan.paths.managed_dir))} "
+            f"--zcode-runtime {sh_single_quote(str(plan.zcode_runtime))} "
+            f"--node-command {sh_single_quote(str(plan.node_command))} "
+            "--yes"
+        )
     lines.append("")
     return "\n".join(lines)
 
@@ -889,13 +931,23 @@ def powershell_single_quote(value: str) -> str:
 def render_launch_agent(plan: InstallPlan) -> dict[str, object]:
     if plan.paths.launch_agent is None:
         raise KeysmithError("LaunchAgent is only available on macOS")
-    return {
+    payload: dict[str, object] = {
         "Label": DEFAULT_LAUNCH_AGENT_LABEL,
         "ProgramArguments": [str(plan.paths.env_script)],
         "RunAtLoad": True,
         "StandardOutPath": str(plan.paths.log_dir / "launchagent.out.log"),
         "StandardErrorPath": str(plan.paths.log_dir / "launchagent.err.log"),
     }
+    if uses_runtime_patch(plan):
+        app = zcode_app_from_runtime(plan.zcode_runtime)
+        watch_paths = [str(plan.zcode_runtime)]
+        if app is not None and str(app) not in watch_paths:
+            watch_paths.append(str(app))
+        payload["StartInterval"] = WATCH_START_INTERVAL_SECONDS
+        payload["ThrottleInterval"] = WATCH_THROTTLE_INTERVAL_SECONDS
+        payload["ExitTimeOut"] = 180
+        payload["WatchPaths"] = watch_paths
+    return payload
 
 
 def render_config(
@@ -921,6 +973,8 @@ def render_config(
         "runtime_original_backup": str(original_runtime_backup_path(plan)) if uses_runtime_patch(plan) else None,
         "environment": env_values(plan),
         "app_bundle_modified": uses_runtime_patch(plan),
+        "python_command": str(Path(sys.executable).resolve()),
+        "auto_repatch_watch": uses_runtime_patch(plan) and platform.system() == "Darwin",
     }
     if platform.system() == "Windows":
         payload["platform"] = "Windows"
@@ -1417,6 +1471,7 @@ def install_lines(plan: InstallPlan, dry_run: bool, backups: list[Path], activat
             "node_options: not used",
             f"activate_current_session: {str(plan.activate).lower()}",
             f"app_bundle_modified: {str(uses_runtime_patch(plan)).lower()}",
+            f"auto_repatch_watch: {str(uses_runtime_patch(plan) and platform.system() == 'Darwin').lower()}",
             "api_key: not read or stored",
             f"zcode_running: {str(is_zcode_running()).lower()}",
             "activation_note: reopen ZCode and start a fresh task",
@@ -1431,6 +1486,8 @@ def install_lines(plan: InstallPlan, dry_run: bool, backups: list[Path], activat
     if not dry_run:
         if uses_runtime_patch(plan):
             lines.append("effect: official agent-server stays in place; glm/zcode.cjs customSystemPrompt reads the managed system-role first")
+            if platform.system() == "Darwin":
+                lines.append("effect: macOS LaunchAgent watches glm/zcode.cjs and re-applies the same patch after an official update")
         else:
             lines.append("effect: new ZCode agent-server processes will use the managed wrapper")
     return lines
@@ -1467,6 +1524,56 @@ def build_install_plan(args: argparse.Namespace) -> InstallPlan:
     )
 
 
+def build_watch_plan(args: argparse.Namespace) -> InstallPlan:
+    paths = build_paths(expand_path(args.managed_dir), expand_path(args.launch_agent) if args.launch_agent else None)
+    zcode_runtime, node_command = runtime_node_from_args(args)
+    saved = load_saved_config(paths) or {}
+    saved_mode = saved.get("injection_mode")
+    if saved_mode in {INJECTION_RUNTIME_PATCH, INJECTION_WRAPPER}:
+        mode = str(saved_mode)
+    else:
+        mode = injection_mode_for_app(zcode_app_from_runtime(zcode_runtime))
+    if (
+        isinstance(saved.get("zcode_runtime"), str)
+        and saved["zcode_runtime"]
+        and not getattr(args, "zcode_runtime", None)
+        and not getattr(args, "zcode_app", None)
+        and not os.environ.get("ZCODE_APP_PATH")
+    ):
+        zcode_runtime = expand_path(str(saved["zcode_runtime"]))
+        if isinstance(saved.get("node_command"), str) and saved["node_command"]:
+            node_command = expand_path(str(saved["node_command"]))
+    return InstallPlan(
+        paths=paths,
+        source_system_file=paths.system_file,
+        zcode_runtime=zcode_runtime,
+        node_command=node_command,
+        activate=False,
+        injection_mode=mode,
+    )
+
+
+def summarize_auto_repatch(paths: InstallPaths) -> dict[str, object]:
+    raw = load_auto_repatch_status(paths)
+    if not raw:
+        return {
+            "last_auto_repatch": "none",
+            "last_auto_repatch_status": "none",
+            "last_auto_repatch_reason": "no auto-repatch has run yet",
+            "last_auto_repatch_at": None,
+            "last_auto_repatch_restarted": False,
+        }
+    status = str(raw.get("status") or "none")
+    display = {"patched": "success", "skipped": "skip"}.get(status, status)
+    return {
+        "last_auto_repatch": display,
+        "last_auto_repatch_status": status,
+        "last_auto_repatch_reason": raw.get("reason") or "",
+        "last_auto_repatch_at": raw.get("checked_at") or raw.get("logged_at"),
+        "last_auto_repatch_restarted": bool(raw.get("restarted")),
+    }
+
+
 def install(plan: InstallPlan, yes: bool, dry_run_flag: bool) -> list[str]:
     system_prompt = read_system_prompt_source(plan.source_system_file)
     ensure_runtime_patchable(plan.zcode_runtime)
@@ -1482,7 +1589,10 @@ def install(plan: InstallPlan, yes: bool, dry_run_flag: bool) -> list[str]:
         return install_lines(plan, dry_run=True, backups=[], activation=[])
 
     with operation_lock(plan.paths):
-        return install_locked(plan, system_prompt)
+        lines = install_locked(plan, system_prompt)
+    if plan.activate:
+        lines.extend(bootstrap_launch_agent(plan))
+    return lines
 
 
 def install_locked(plan: InstallPlan, system_prompt: str) -> list[str]:
@@ -1518,6 +1628,401 @@ def install_locked(plan: InstallPlan, system_prompt: str) -> list[str]:
             ) from exc
         raise
     return install_lines(plan, dry_run=False, backups=backups, activation=activation)
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def runtime_stat_signature(path: Path) -> tuple[int, int] | None:
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return (st.st_size, int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1_000_000_000))))
+
+
+def wait_for_runtime_settle(
+    path: Path,
+    *,
+    timeout: float = WATCH_SETTLE_TIMEOUT_SECONDS,
+    stable_for: float = WATCH_SETTLE_STABLE_SECONDS,
+    poll: float = WATCH_SETTLE_POLL_SECONDS,
+    clock=time.monotonic,
+    sleeper=time.sleep,
+) -> bool:
+    """Wait until runtime exists and size+mtime stay still, so ShipIt is done swapping."""
+    deadline = clock() + timeout
+    last: tuple[int, int] | None = None
+    stable_since: float | None = None
+    while True:
+        now = clock()
+        sig = runtime_stat_signature(path)
+        if sig is None or sig[0] <= 0:
+            last = None
+            stable_since = None
+        elif sig != last:
+            last = sig
+            stable_since = now
+        elif stable_since is not None and now - stable_since >= stable_for:
+            return True
+        remaining = deadline - now
+        if remaining <= 0:
+            return False
+        sleeper(min(poll, remaining))
+
+
+def load_auto_repatch_status(paths: InstallPaths) -> dict[str, object] | None:
+    status_file = auto_repatch_status_path(paths)
+    if not status_file.is_file():
+        return None
+    try:
+        loaded = json.loads(status_file.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return loaded if isinstance(loaded, dict) else None
+
+
+def write_auto_repatch_status(paths: InstallPaths, payload: dict[str, object]) -> None:
+    paths.log_dir.mkdir(parents=True, exist_ok=True)
+    body = dict(payload)
+    body.setdefault("schema", AUTO_REPATCH_SCHEMA)
+    body.setdefault("keysmith_version", VERSION)
+    body.setdefault("checked_at", utc_now_iso())
+    previous = load_auto_repatch_status(paths)
+    # Periodic already-patched polls must not hide a successful re-patch.
+    if previous and body.get("status") == "skipped" and previous.get("status") == "patched":
+        previous = dict(previous)
+        previous["checked_at"] = body["checked_at"]
+        body = previous
+    write_text_atomic(auto_repatch_status_path(paths), json.dumps(body, ensure_ascii=False, indent=2) + "\n")
+
+
+def append_auto_repatch_log(paths: InstallPaths, payload: dict[str, object]) -> None:
+    paths.log_dir.mkdir(parents=True, exist_ok=True)
+    event = dict(payload)
+    event.setdefault("logged_at", utc_now_iso())
+    with auto_repatch_log_path(paths).open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+
+def persist_runtime_backup(paths: InstallPaths, backup: Path, runtime: Path) -> None:
+    config = load_saved_config(paths) or {}
+    config["runtime_original_backup"] = str(backup)
+    config["zcode_runtime"] = str(runtime)
+    config["app_bundle_modified"] = True
+    paths.config_file.parent.mkdir(parents=True, exist_ok=True)
+    write_text_atomic(paths.config_file, json.dumps(config, ensure_ascii=False, indent=2) + "\n")
+
+
+def applescript_string(value: str) -> str:
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def notify_user(title: str, message: str, runner=subprocess.run) -> bool:
+    if platform.system() != "Darwin":
+        return False
+    script = f"display notification {applescript_string(message)} with title {applescript_string(title)}"
+    try:
+        completed = runner(
+            ["osascript", "-e", script],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+    except OSError:
+        return False
+    return completed.returncode == 0
+
+
+def quit_running_zcode(
+    *,
+    timeout: float = WATCH_QUIT_TIMEOUT_SECONDS,
+    clock=time.monotonic,
+    sleeper=time.sleep,
+    runner=subprocess.run,
+) -> bool:
+    if platform.system() != "Darwin":
+        return not is_zcode_running()
+    try:
+        runner(
+            ["osascript", "-e", 'tell application "ZCode" to quit'],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+    except OSError:
+        pass
+    deadline = clock() + timeout
+    while clock() < deadline:
+        if not is_zcode_running():
+            return True
+        sleeper(min(0.25, deadline - clock()))
+    try:
+        runner(["pkill", "-x", "ZCode"], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    except OSError:
+        pass
+    sleeper(0.4)
+    return not is_zcode_running()
+
+
+def open_zcode_app(app: Path | None, runner=subprocess.run) -> bool:
+    if platform.system() != "Darwin":
+        return False
+    command = ["open", str(app)] if app is not None and app.exists() else ["open", "-a", "ZCode"]
+    try:
+        completed = runner(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    except OSError:
+        return False
+    return completed.returncode == 0
+
+
+def launchd_gui_target() -> str | None:
+    getuid = getattr(os, "getuid", None)
+    if not callable(getuid):
+        return None
+    try:
+        uid = getuid()
+    except OSError:
+        return None
+    return f"gui/{uid}/{DEFAULT_LAUNCH_AGENT_LABEL}"
+
+
+def bootstrap_launch_agent(plan: InstallPlan, runner=subprocess.run) -> list[str]:
+    if platform.system() != "Darwin" or plan.paths.launch_agent is None or not plan.paths.launch_agent.is_file():
+        return []
+    target = launchd_gui_target()
+    if target is None:
+        return ["launchctl bootstrap skipped: no launchd user domain"]
+    domain = target.rsplit("/", 1)[0]
+    try:
+        runner(
+            ["launchctl", "bootout", target],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        completed = runner(
+            ["launchctl", "bootstrap", domain, str(plan.paths.launch_agent)],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+    except OSError as exc:
+        return [f"launchctl bootstrap skipped: {exc}"]
+    if completed.returncode == 0:
+        return [f"launchctl bootstrap {target}: ok"]
+    detail = (completed.stderr or completed.stdout).strip() or f"exit {completed.returncode}"
+    return [f"launchctl bootstrap {target}: {detail}"]
+
+
+def bootout_launch_agent(paths: InstallPaths, runner=subprocess.run) -> list[str]:
+    if platform.system() != "Darwin" or paths.launch_agent is None:
+        return []
+    target = launchd_gui_target()
+    if target is None:
+        return ["launchctl bootout skipped: no launchd user domain"]
+    try:
+        completed = runner(
+            ["launchctl", "bootout", target],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+    except OSError as exc:
+        return [f"launchctl bootout skipped: {exc}"]
+    detail = (completed.stderr or completed.stdout).strip()
+    if completed.returncode == 0 or "No such process" in detail or "not found" in detail.lower():
+        return [f"launchctl bootout {target}: ok"]
+    return [f"launchctl bootout {target}: {detail or f'exit {completed.returncode}'}"]
+
+
+def classify_runtime_for_repatch(runtime_text: str) -> str:
+    if runtime_text_prefers_managed(runtime_text):
+        return "skipped"
+    if vendor_patch_anchor(runtime_text) is not None:
+        return "patchable"
+    return "unknown_hook"
+
+
+def auto_repatch_result(
+    status: str,
+    reason: str,
+    *,
+    runtime: Path | None = None,
+    restarted: bool = False,
+    notified: bool = False,
+    write: bool = False,
+    extra: dict[str, object] | None = None,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "status": status,
+        "reason": reason,
+        "runtime": str(runtime) if runtime is not None else None,
+        "restarted": restarted,
+        "notified": notified,
+        "write": write,
+    }
+    if extra:
+        payload.update(extra)
+    return payload
+
+
+def run_auto_repatch(
+    plan: InstallPlan,
+    *,
+    yes: bool,
+    dry_run_flag: bool,
+    restart: bool = True,
+    settle_timeout: float = WATCH_SETTLE_TIMEOUT_SECONDS,
+    settle_stable: float = WATCH_SETTLE_STABLE_SECONDS,
+    clock=time.monotonic,
+    sleeper=time.sleep,
+    notifier=notify_user,
+    quitter=quit_running_zcode,
+    opener=open_zcode_app,
+) -> dict[str, object]:
+    """Re-apply the known runtime patch after an official ZCode swap. Never guess new anchors."""
+    dry_run = dry_run_flag or not yes
+    runtime_path = plan.zcode_runtime
+    if not uses_runtime_patch(plan):
+        result = auto_repatch_result("skipped", "injection mode is wrapper; auto-repatch is for 3.12+ runtime-patch", runtime=runtime_path, write=not dry_run)
+        if not dry_run:
+            write_auto_repatch_status(plan.paths, result)
+            append_auto_repatch_log(plan.paths, result)
+        return result
+    if not plan.paths.system_file.is_file():
+        result = auto_repatch_result("error", f"managed system-role missing: {plan.paths.system_file}", runtime=runtime_path, write=not dry_run)
+        if not dry_run:
+            write_auto_repatch_status(plan.paths, result)
+            append_auto_repatch_log(plan.paths, result)
+        return result
+    if not wait_for_runtime_settle(
+        runtime_path,
+        timeout=settle_timeout,
+        stable_for=settle_stable,
+        clock=clock,
+        sleeper=sleeper,
+    ):
+        result = auto_repatch_result(
+            "unsettled",
+            "official runtime did not finish settling after a ZCode update",
+            runtime=runtime_path,
+            write=not dry_run,
+        )
+        if not dry_run:
+            write_auto_repatch_status(plan.paths, result)
+            append_auto_repatch_log(plan.paths, result)
+        return result
+    try:
+        runtime_text = read_required_text(runtime_path, "ZCode runtime")
+    except KeysmithError as exc:
+        result = auto_repatch_result("error", str(exc), runtime=runtime_path, write=not dry_run)
+        if not dry_run:
+            write_auto_repatch_status(plan.paths, result)
+            append_auto_repatch_log(plan.paths, result)
+        return result
+    kind = classify_runtime_for_repatch(runtime_text)
+    if kind == "skipped":
+        result = auto_repatch_result("skipped", "runtime already prefers the managed system-role", runtime=runtime_path, write=not dry_run)
+        if not dry_run:
+            write_auto_repatch_status(plan.paths, result)
+            append_auto_repatch_log(plan.paths, result)
+        return result
+    if kind == "unknown_hook":
+        digest = hashlib.sha256(runtime_text.encode("utf-8")).hexdigest()
+        reason = (
+            "ZCode runtime anchors changed; Keysmith needs an upgrade before it can patch this build. "
+            "Auto-repatch did not modify the app."
+        )
+        previous = load_auto_repatch_status(plan.paths) or {}
+        already_reported = previous.get("status") == "unknown_hook" and previous.get("runtime_sha256") == digest
+        notified = False
+        if not dry_run and not already_reported:
+            notified = bool(notifier("zcode-keysmith", "Keysmith 需要升级：ZCode runtime 锚点已变，已跳过自动重打。"))
+        result = auto_repatch_result(
+            "unknown_hook",
+            reason,
+            runtime=runtime_path,
+            notified=notified,
+            write=not dry_run,
+            extra={"runtime_sha256": digest},
+        )
+        if not dry_run:
+            write_auto_repatch_status(plan.paths, result)
+            append_auto_repatch_log(plan.paths, result)
+        return result
+    if dry_run:
+        return auto_repatch_result(
+            "patchable",
+            "vendor runtime is a known 3.12/3.14 shape; would patch, backup, and restart if ZCode is running",
+            runtime=runtime_path,
+            write=False,
+        )
+    digest = hashlib.sha256(runtime_text.encode("utf-8")).hexdigest()
+    backup_path = original_runtime_backup_path(plan, digest)
+    was_running = is_zcode_running()
+    apply_runtime_patch(plan)
+    persist_runtime_backup(plan.paths, backup_path, runtime_path)
+    restarted = False
+    if restart and was_running:
+        if quitter(clock=clock, sleeper=sleeper):
+            restarted = bool(opener(zcode_app_from_runtime(runtime_path)))
+        else:
+            restarted = False
+    result = auto_repatch_result(
+        "patched",
+        "reapplied the known runtime-patch after an official ZCode update",
+        runtime=runtime_path,
+        restarted=restarted,
+        write=True,
+        extra={
+            "runtime_sha256": digest,
+            "runtime_original_backup": str(backup_path),
+        },
+    )
+    write_auto_repatch_status(plan.paths, result)
+    append_auto_repatch_log(plan.paths, result)
+    return result
+
+
+def watch(plan: InstallPlan, yes: bool, dry_run_flag: bool, restart: bool = True, **kwargs) -> dict[str, object]:
+    dry_run = dry_run_flag or not yes
+    if dry_run:
+        return run_auto_repatch(plan, yes=False, dry_run_flag=True, restart=restart, **kwargs)
+    try:
+        with operation_lock(plan.paths):
+            return run_auto_repatch(plan, yes=True, dry_run_flag=False, restart=restart, **kwargs)
+    except KeysmithError as exc:
+        status = "busy" if "already running" in str(exc) else "error"
+        result = auto_repatch_result(status, str(exc), runtime=plan.zcode_runtime, write=False)
+        try:
+            append_auto_repatch_log(plan.paths, result)
+            if status != "busy":
+                write_auto_repatch_status(plan.paths, result)
+        except OSError:
+            pass
+        return result
+
+
+def watch_lines(result: dict[str, object], dry_run: bool) -> list[str]:
+    lines = ["zcode-keysmith watch preview" if dry_run else "zcode-keysmith watch complete"]
+    status = result.get("status", "unknown")
+    lines.append(f"status: {status}")
+    lines.append(f"reason: {result.get('reason') or ''}")
+    lines.append(f"runtime: {result.get('runtime') or 'missing'}")
+    lines.append(f"restarted: {str(bool(result.get('restarted'))).lower()}")
+    lines.append(f"notified: {str(bool(result.get('notified'))).lower()}")
+    lines.append(f"write: {str(bool(result.get('write'))).lower()}")
+    backup = result.get("runtime_original_backup")
+    if backup:
+        lines.append(f"backup: {backup}")
+    return lines
 
 
 def launchctl_getenv(key: str) -> str | None:
@@ -1584,6 +2089,7 @@ def doctor_lines(paths: InstallPaths, zcode_runtime: Path, node_command: Path) -
         injection_mode=injection_mode_for_app(zcode_app_from_runtime(zcode_runtime)),
     )
     expected_env = env_values(expected_plan)
+    auto = summarize_auto_repatch(paths)
     lines = [
         "zcode-keysmith doctor",
         f"managed_dir: {paths.managed_dir}",
@@ -1608,6 +2114,11 @@ def doctor_lines(paths: InstallPaths, zcode_runtime: Path, node_command: Path) -
         f"runtime_agentsmd_override_neutralized: {str(_runtime_override_neutralized(runtime_text)).lower()}",
         f"zcode_memory_index_lexicon: {_memory_index_lexicon_status()}",
         f"injection_mode: {expected_plan.injection_mode}",
+        f"auto_repatch_watch: {str(uses_runtime_patch(expected_plan) and platform.system() == 'Darwin').lower()}",
+        f"last_auto_repatch: {auto['last_auto_repatch']}",
+        f"last_auto_repatch_status: {auto['last_auto_repatch_status']}",
+        f"last_auto_repatch_reason: {auto['last_auto_repatch_reason']}",
+        f"last_auto_repatch_at: {auto['last_auto_repatch_at'] or 'none'}",
         f"node_command: {node_command}",
         f"node_command_exists: {str(node_command.exists()).lower()}",
         f"app_bundle_modified: {str(uses_runtime_patch(expected_plan) and runtime_patched).lower()}",
@@ -1722,7 +2233,7 @@ def verify_lines(paths: InstallPaths, zcode_runtime: Path, node_command: Path, s
 
 def uninstall_lines(paths: InstallPaths, dry_run: bool, removed: list[Path], activation: list[str]) -> list[str]:
     lines = ["zcode-keysmith uninstall preview" if dry_run else "zcode-keysmith uninstall complete"]
-    targets = [paths.system_file, paths.config_file, paths.wrapper, paths.preload, paths.env_script]
+    targets = [paths.system_file, paths.config_file, paths.wrapper, paths.preload, paths.env_script, installer_copy_path(paths)]
     if paths.launch_agent is not None:
         targets.append(paths.launch_agent)
     for path in targets:
@@ -1875,10 +2386,11 @@ def uninstall(paths: InstallPaths, yes: bool, dry_run_flag: bool, activate: bool
 
 def uninstall_locked(paths: InstallPaths, activate: bool) -> list[str]:
     removed = []
-    targets = [paths.system_file, paths.config_file, paths.wrapper, paths.preload, paths.env_script]
+    targets = [paths.system_file, paths.config_file, paths.wrapper, paths.preload, paths.env_script, installer_copy_path(paths)]
     if paths.launch_agent is not None:
         targets.append(paths.launch_agent)
     config = load_saved_config(paths)
+    bootout_notes = bootout_launch_agent(paths) if activate else []
     restore_notes = restore_runtime_from_config(config)
     moved: list[tuple[Path, Path]] = []
     try:
@@ -1914,6 +2426,7 @@ def uninstall_locked(paths: InstallPaths, activate: bool) -> list[str]:
             ) from exc
         raise
     lines = uninstall_lines(paths, dry_run=False, removed=removed, activation=activation)
+    lines.extend(bootout_notes)
     lines.extend(restore_notes)
     return lines
 
@@ -1991,6 +2504,8 @@ def install_report(plan: InstallPlan, dry_run: bool, backups: list[Path], activa
         _json_action(action_name, plan.paths.preload, "preload"),
         _json_action(action_name, plan.paths.env_script, "env_script"),
     ]
+    if uses_runtime_patch(plan) and platform.system() == "Darwin":
+        actions.append(_json_action(action_name, installer_copy_path(plan.paths), "installer_copy"))
     if plan.paths.launch_agent is not None:
         actions.append(_json_action(action_name, plan.paths.launch_agent, "launch_agent"))
     for backup in backups:
@@ -2012,6 +2527,7 @@ def install_report(plan: InstallPlan, dry_run: bool, backups: list[Path], activa
             "backups": [str(path) for path in backups],
             "injection_mode": plan.injection_mode,
             "zcode_running": is_zcode_running(),
+            "auto_repatch_watch": uses_runtime_patch(plan) and platform.system() == "Darwin",
         },
     )
 
@@ -2110,6 +2626,8 @@ def doctor_report(paths: InstallPaths, zcode_runtime: Path, node_command: Path) 
             "env": env,
             "backups": list_backup_files(paths),
             "app_bundle_modified": uses_runtime_patch(expected_plan) and runtime_patched,
+            "auto_repatch_watch": uses_runtime_patch(expected_plan) and platform.system() == "Darwin",
+            **summarize_auto_repatch(paths),
         },
     )
 
@@ -2174,9 +2692,33 @@ def verify_report(paths: InstallPaths, zcode_runtime: Path, node_command: Path, 
     )
 
 
+def watch_report(plan: InstallPlan, dry_run: bool, result: dict[str, object]) -> dict[str, object]:
+    status = str(result.get("status") or "unknown")
+    ok = status in {"patched", "skipped", "patchable", "busy"}
+    extra = {
+        "managed_dir": str(plan.paths.managed_dir),
+        "runtime": result.get("runtime"),
+        "status": status,
+        "reason": result.get("reason"),
+        "restarted": bool(result.get("restarted")),
+        "notified": bool(result.get("notified")),
+        "write": bool(result.get("write")),
+        "runtime_original_backup": result.get("runtime_original_backup"),
+        "last_auto_repatch": summarize_auto_repatch(plan.paths)["last_auto_repatch"] if not dry_run else {"patched": "success", "skipped": "skip", "patchable": "success"}.get(status, status),
+    }
+    return _json_report(
+        "watch",
+        "preview" if dry_run else "execute",
+        ok,
+        0 if ok else 1,
+        extra=extra,
+        blockers=[] if ok else [str(result.get("reason") or status)],
+    )
+
+
 def uninstall_report(paths: InstallPaths, dry_run: bool, removed: list[Path], activation: list[str]) -> dict[str, object]:
     action_name = "plan" if dry_run else "remove"
-    targets = [paths.system_file, paths.config_file, paths.wrapper, paths.preload, paths.env_script]
+    targets = [paths.system_file, paths.config_file, paths.wrapper, paths.preload, paths.env_script, installer_copy_path(paths)]
     if paths.launch_agent is not None:
         targets.append(paths.launch_agent)
     actions = [_json_action(action_name, path, "target") for path in targets]
@@ -2244,6 +2786,17 @@ def build_parser() -> argparse.ArgumentParser:
     uninstall_parser.add_argument("--no-activate", action="store_true")
     uninstall_parser.add_argument("--json", action="store_true", help="Emit stable JSON (zcode-keysmith/v1)")
 
+    watch_parser = sub.add_parser("watch", help="Re-apply the runtime patch after an official ZCode update (macOS LaunchAgent)")
+    watch_parser.add_argument("--managed-dir", default=str(DEFAULT_MANAGED_DIR))
+    watch_parser.add_argument("--launch-agent", default=None)
+    watch_parser.add_argument("--zcode-app", default=None)
+    watch_parser.add_argument("--zcode-runtime", default=None)
+    watch_parser.add_argument("--node-command", default=None)
+    watch_parser.add_argument("--dry-run", action="store_true")
+    watch_parser.add_argument("--yes", action="store_true", help="Allow writing the runtime patch. --dry-run wins if both are provided")
+    watch_parser.add_argument("--no-restart", action="store_true", help="Do not quit and reopen ZCode after a successful patch")
+    watch_parser.add_argument("--json", action="store_true", help="Emit stable JSON (zcode-keysmith/v1)")
+
     return parser
 
 
@@ -2253,7 +2806,7 @@ def _usage_error_mode(argv: list[str]) -> str:
 
 def _operation_from_argv(argv: list[str]) -> str:
     for item in argv:
-        if item in {"install", "doctor", "verify", "uninstall"}:
+        if item in {"install", "doctor", "verify", "uninstall", "watch"}:
             return item
     return "unknown"
 
@@ -2355,6 +2908,16 @@ def main(argv: Iterable[str] | None = None) -> int:
                 return int(report["exit_status"])
             print("\n".join(verify_lines(paths, zcode_runtime, node_command, smoke=not args.no_smoke)))
             return 0
+        if command == "watch":
+            plan = build_watch_plan(args)
+            dry_run = args.dry_run or not args.yes
+            result = watch(plan, yes=args.yes, dry_run_flag=args.dry_run, restart=not args.no_restart)
+            if use_json:
+                report = watch_report(plan, dry_run, result)
+                _json_dump(report)
+                return int(report["exit_status"])
+            print("\n".join(watch_lines(result, dry_run=dry_run)))
+            return 0 if str(result.get("status")) in {"patched", "skipped", "patchable", "busy"} else 1
         if command == "uninstall":
             paths = build_paths(expand_path(args.managed_dir), expand_path(args.launch_agent) if args.launch_agent else None)
             dry_run = args.dry_run or not args.yes

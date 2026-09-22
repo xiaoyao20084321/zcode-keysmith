@@ -2,11 +2,17 @@
 
 ## [Unreleased]
 
+- **Desktop 0.1.0-beta.1（候选，尚未打 tag）：** 第一份 unsigned 桌面包，sidecar 绑 master 上的 CLI **0.3.2**，不是 Latest tag `v0.3.1` zip。GUI 版本保持 `0.1.0-beta.1`（源码从未公开发包）。
+- GUI 超时：leader 退出后管道仍被子孙持有时，对启动时保存的 pid 进程组 SIGKILL；保留 500 ms `finish_read_task`。回归 `timeout_covers_pipes_after_leader_exit`。
+- Dashboard 失败对齐 `StatusFailure`：timeout / exit / stdout / stderr，不只一句 `error.message`。
+- 新增 `.github/workflows/desktop-candidate.yml`：macos-15 arm64 DMG + windows-2025 NSIS，原生 sidecar，`--version` 与隔离目录 `doctor --json`。不跑 scenario / fixture 烟测。
+- `gui/SPEC.md` 补成与 Claude 同级约束文。`gui/README.md` 去掉不存在的 Windows candidate CI 陈述。
+
 ## [0.3.2] - 待发布
 
 - 适配 ZCode 3.14.0 的 runtime 锚点：`customSystemPrompt` 配置对象中间插入了 `workflowActor`，CLI-prefix 守卫也从 `if(t.push(...),o?...)` 改成 `if(l||t.push(...),s?...)`。0.3.1 会因此报 `entrypoint shape was not recognized`，CLI-prefix skip 即使主锚点修好也会静默失效。
 - 安装器同时识别 3.12 与 3.14 锚点，保留 3.12 形态；3.14 仅在没有 `workflowActor` 时注入受管提示词，保留原生互斥检查和 workflow 子会话上下文。
-- 自动更新会整包替换 `glm/zcode.cjs` 并抹掉补丁。更新后需重新 `install`；卸载仍从备份还原。
+- **跟随官方自动更新（macOS，#33）：** runtime-patch 安装把 LaunchAgent 从「登录时只 setenv」改成监视 `glm/zcode.cjs` / `ZCode.app`。ShipIt 换包并等文件稳定后，用与 `install` 相同的已知锚点重打补丁、备份新的官方原文件；若 ZCode 已用未打补丁的进程拉起来，打完后退出并再打开一次。锚点不认识时不硬打，写 `logs/auto-repatch.json` 并通知「Keysmith 需要升级」。`doctor` 报告 `last_auto_repatch`：`success` / `skip` / `unknown_hook`。不猜未来锚点，不从 GitHub 自更新 Keysmith。Windows 监视仍不在本版。
 
 ## [0.3.1] - 2026-09-19
 

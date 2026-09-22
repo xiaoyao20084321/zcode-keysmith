@@ -66,7 +66,7 @@ Keysmith 给本机的 AI 编程工具装指令：先预览，再写入，能验�
 | [Codex](https://github.com/Jia-Ethan/codex-keysmith) | codex-keysmith | 稳定版安装包 |
 | [Claude Code](https://github.com/Jia-Ethan/claude-keysmith) | claude-keysmith | 源码 |
 | [Grok Build](https://github.com/Jia-Ethan/grok-keysmith) | grok-keysmith | 稳定版安装包 |
-| **ZCode** | **zcode-keysmith** | 稳定版安装包 |
+| **ZCode** | **zcode-keysmith** | 源码 zip；桌面候选见下方 |
 
 每个工具一份安装器。选你正在用的即可。
 
@@ -84,7 +84,9 @@ Keysmith 给本机的 AI 编程工具装指令：先预览，再写入，能验�
 
 ## 开始使用
 
-本机需要已经装好 ZCode。下方命令下载目前公开的 0.3.1，不支持 ZCode 3.14。3.14 兼容修复已在 0.3.2 源码中；等 `v0.3.2` Release 发布后，应改用该版本的 zip 和校验文件。`v0.3.0` 会停在启动页。ZCode 自动更新会抹掉补丁，更新后需要再装一次。
+本机需要已经装好 ZCode。下方命令下载目前公开的 0.3.1 zip，不支持 ZCode 3.14。3.14 兼容修复与「官方更新后自动重打补丁」已在 0.3.2 源码中；等 `v0.3.2` Release 发布后，应改用该版本的 zip 和校验文件。`v0.3.0` 会停在启动页。macOS 上 0.3.2 的 LaunchAgent 会在官方自动更新换包后重打同一套补丁；锚点变了则跳过并提示升级 Keysmith。
+
+源码安装是当前公开入口。仓库里有第一份 unsigned 桌面候选（GUI `0.1.0-beta.1`，bundled CLI = 0.3.2）；`desktop-v0.1.0-beta.1` tag 还没打，不要把它当成已发布安装包。
 
 **macOS：**
 
@@ -136,6 +138,7 @@ macOS 与 Windows。需要 Python 3.10+。Linux 暂不支持。
 - [使用说明](docs/reference.md)
 - [代装说明](docs/agent-install.md)
 - [测量说明](breaktest/report.md)
+- [桌面客户端 SPEC](gui/SPEC.md)
 
 ## 系列
 
